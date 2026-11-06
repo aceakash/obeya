@@ -53,6 +53,9 @@ export const NARRATION_LOAD_MS = 10 * 60_000;
  */
 export const NARRATION_SENTENCE_MS = 5 * 60_000;
 
+/** A descendant may inherit stderr and keep it open after the voice itself has died. */
+const STDERR_DRAIN_MS = 5000;
+
 interface Job {
   argv: string[];
   request: ClipRequest;
@@ -65,6 +68,8 @@ interface Running {
   lines: AsyncIterator<string>;
   /** The tail of its stderr: why, when it dies. */
   stderr: string[];
+  stderrDone: Promise<void>;
+  stderrAbort: AbortController;
 }
 
 export class NarrationHost {
@@ -147,14 +152,23 @@ export class NarrationHost {
     } catch (e) {
       return { error: `the voice did not start: ${messageOf(e)}` };
     }
-    const voice: Running = { key, child, lines: lines(child.stdout)[Symbol.asyncIterator](), stderr: [] };
+    const stderr: string[] = [];
+    const stderrAbort = new AbortController();
+    const stream = new TransformStream<Uint8Array, Uint8Array>();
+    const piping = child.stderr.pipeTo(stream.writable, { signal: stderrAbort.signal });
     // read all along, so a chatty voice never blocks on a full pipe
-    void (async () => {
-      for await (const line of lines(child.stderr)) {
-        voice.stderr.push(line);
-        if (voice.stderr.length > 40) voice.stderr.shift();
+    const reading = (async () => {
+      for await (const line of lines(stream.readable)) {
+        stderr.push(line);
+        if (stderr.length > 40) stderr.shift();
       }
     })();
+    // Cancellation can finish after the reader rejects: retain the pipe's cleanup promise too.
+    const stderrDone = Promise.allSettled([piping, reading]).then((results) => {
+      const failed = results.find((r) => r.status === 'rejected');
+      if (failed && !stderrAbort.signal.aborted) stderr.push(`reading the voice's stderr failed: ${messageOf(failed.reason)}`);
+    });
+    const voice: Running = { key, child, lines: lines(child.stdout)[Symbol.asyncIterator](), stderr, stderrDone, stderrAbort };
     this.voice = voice;
     this.o.log?.(`Obeya: starting the narration voice (${argv.slice(-6).join(' ')})`);
     const ready = await this.reply(voice, this.o.loadMs ?? NARRATION_LOAD_MS);
@@ -201,7 +215,7 @@ export class NarrationHost {
       await gone(5000);
     }
     const silence = ms >= 60_000 ? `${Math.round(ms / 60_000)} min` : `${ms / 1000} s`;
-    const why = voice.stderr.join('\n').trim().slice(-1500);
+    const why = await this.diagnostic(voice);
     const error = `the voice said nothing for ${silence} while ${doing} and was ended${why ? `: ${why}` : ''}`;
     this.o.log?.(`Obeya: ${error}`);
     return { error };
@@ -210,11 +224,23 @@ export class NarrationHost {
   private async died(voice: Running): Promise<{ error: string }> {
     if (this.voice === voice) this.voice = undefined;
     const code = await voice.child.exited;
-    // the stderr reader may still hold the last lines
-    await Bun.sleep(50);
-    const error = `the voice stopped (${code}): ${voice.stderr.join('\n').trim().slice(-1500)}`;
+    const error = `the voice stopped (${code}): ${await this.diagnostic(voice)}`;
     this.o.log?.(`Obeya: ${error}`);
     return { error };
+  }
+
+  private async diagnostic(voice: Running): Promise<string> {
+    // Process exit and delivery of the last diagnostic lines can finish in either order.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const drained = await Promise.race([
+      voice.stderrDone.then(() => true),
+      new Promise<false>((resolve) => (timer = setTimeout(() => resolve(false), STDERR_DRAIN_MS))),
+    ]).finally(() => clearTimeout(timer));
+    if (!drained) {
+      voice.stderrAbort.abort();
+      await voice.stderrDone;
+    }
+    return voice.stderr.join('\n').trim().slice(-1500);
   }
 
   /** Ends the voice gently. */

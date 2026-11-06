@@ -217,7 +217,9 @@ A voice that can stay loaded (so far Qwen3-TTS) is started on the first uncached
 once the model is loaded, a line per sentence done, then `ok` or `error` per clip. So the model and
 the reference load once (a warm load costs about 2 s, a cold one 17 s, a clip 2–4 s). The libraries
 print on stdout too, so the voice moves its stdout to stderr and keeps a duplicate for the protocol;
-a stray line is shown and skipped. A voice that dies stops the render with the tail of its stderr;
+a stray line is shown and skipped. A voice that dies stops the render with the tail of its stderr,
+including its final diagnostic lines. Reading those lines is given at most five seconds after
+the voice exits, so a descendant that inherited its stderr cannot hold up the clips behind it;
 one silent for 10 minutes while it loads or 5 minutes on a sentence (seconds on a GPU, a minute or
 two on a slow CPU) is ended and its clip fails the same way. The sentence lines keep a long clip from
 looking stuck.

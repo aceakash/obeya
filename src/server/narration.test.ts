@@ -60,6 +60,25 @@ const until = async (done: () => boolean) => {
   for (let i = 0; i < 100 && !done(); i++) await Bun.sleep(50);
 };
 
+/** Keep real subprocesses, replacing only the delivery of their stderr for lifecycle probes. */
+function interceptStderr(change: (stream: ReadableStream<Uint8Array>, exited: Promise<number>) => ReadableStream<Uint8Array>) {
+  const spawn = Bun.spawn;
+  const wrapped = (...args: Parameters<typeof Bun.spawn>) => {
+    const child = spawn(...args);
+    if (!(child.stderr instanceof ReadableStream)) throw new Error('the voice must pipe stderr');
+    const stderr = change(child.stderr, child.exited);
+    return new Proxy(child, {
+      get(target, key) {
+        if (key === 'stderr') return stderr;
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  };
+  // Preserve Bun.spawn's overloads; the wrapper delegates the actual spawning unchanged.
+  return spyOn(Bun, 'spawn').mockImplementation(wrapped as typeof Bun.spawn);
+}
+
 describe('the voice Obeya holds', () => {
   test('starts once for the clips of several renders, which take turns in the order they asked', async () => {
     hold();
@@ -110,6 +129,115 @@ describe('the voice Obeya holds', () => {
     expect(await host.clip(clip('drei', 'dies'))).toEqual({ ok: true, seconds: 0.01 });
     expect(await host.clip(clip('vier', 'stumm'))).toEqual({ error: expect.stringContaining('the voice stopped (2): cannot load the model') });
     expect(log().filter((l) => l.startsWith('start'))).toEqual(['start dies', 'start dies', 'start stumm']);
+  });
+
+  test.each([
+    { stage: 'dying', speaker: 'stumm', text: 'eins', error: 'the voice stopped (2): cannot load the model' },
+    { stage: 'loading', speaker: 'lahm', text: 'eins', error: 'the voice said nothing for 0.3 s while loading and was ended: waiting for the GPU' },
+    { stage: 'making a clip', speaker: 'ryan', text: 'hängt', error: 'the voice said nothing for 0.3 s while making a clip and was ended: generating hängt' },
+  ])('a voice waits for its stderr reader before reporting why it stopped ($stage)', async ({ stage, speaker, text, error }) => {
+    const exit = Promise.withResolvers<number>();
+    const reading = Promise.withResolvers<void>();
+    const drain = Promise.withResolvers<void>();
+    const spawned = interceptStderr((stream, exited) => {
+      void exited.then(exit.resolve);
+      // Keep the real process and bytes; make stderr delivery lag behind process exit.
+      return stream.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+        async transform(chunk, controller) {
+          reading.resolve();
+          await drain.promise;
+          controller.enqueue(chunk);
+        },
+      }));
+    });
+    const setTimer = globalThis.setTimeout;
+    const deadlines: (() => void)[] = [];
+    const schedule = (...[callback, ms, ...args]: Parameters<typeof setTimer>) => {
+      if (ms !== 300) return setTimer(callback, ms, ...args);
+      deadlines.push(() => callback(...args));
+      return setTimer(() => {}, 0);
+    };
+    const timer = spyOn(globalThis, 'setTimeout').mockImplementation(schedule as typeof setTimeout);
+    try {
+      hold(60_000, { loadMs: 300, sentenceMs: 300 });
+      const reply = host.clip(clip(text, speaker));
+      await reading.promise;
+      if (stage !== 'dying') deadlines.at(-1)!();
+      const code = await exit.promise;
+      if (stage === 'dying') expect(code).toBe(2);
+      // An exited process does not imply its pending diagnostic bytes have been delivered.
+      expect(await Promise.race([reply, Bun.sleep(100).then(() => 'pending')])).toBe('pending');
+      drain.resolve();
+      expect(await reply).toEqual({ error });
+    } finally {
+      drain.resolve();
+      host?.stop();
+      spawned.mockRestore();
+      timer.mockRestore();
+    }
+  });
+
+  test('a descendant holding stderr open cannot block the next clip after the voice dies', async () => {
+    const cancelling = Promise.withResolvers<void>();
+    const finishCancel = Promise.withResolvers<void>();
+    const cancelled = Promise.withResolvers<void>();
+    const spawned = interceptStderr((stream) => {
+      const reader = stream.getReader();
+      let stopped = false;
+      return new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          const next = await reader.read();
+          if (stopped) return;
+          if (next.done) { controller.close(); reader.releaseLock(); }
+          else controller.enqueue(next.value);
+        },
+        async cancel() {
+          stopped = true;
+          await reader.cancel();
+          reader.releaseLock();
+          cancelling.resolve();
+          await finishCancel.promise;
+          cancelled.resolve();
+        },
+      });
+    });
+    const pidFile = join(dir, 'descendant');
+    writeFileSync(join(dir, 'voice.ts'), `
+      import { writeFileSync } from 'node:fs';
+      const child = Bun.spawn([process.execPath, '-e', 'await Bun.sleep(60000)'], { stdin: 'ignore', stdout: 'ignore', stderr: 'inherit' });
+      writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
+      console.error('parent failed');
+      process.exit(3);
+    `);
+    const setTimer = globalThis.setTimeout;
+    const deadline = Promise.withResolvers<() => void>();
+    const schedule = (...[callback, ms, ...args]: Parameters<typeof setTimer>) => {
+      if (ms !== 5000) return setTimer(callback, ms, ...args);
+      deadline.resolve(() => callback(...args));
+      return setTimer(() => {}, 0);
+    };
+    const timer = spyOn(globalThis, 'setTimeout').mockImplementation(schedule as typeof setTimeout);
+    try {
+      hold();
+      const reply = host.clip(clip('eins'));
+      // Expire only the drain deadline, after the real parent exited with stderr still open.
+      (await deadline.promise)();
+      await cancelling.promise;
+      expect(await Promise.race([reply, Bun.sleep(100).then(() => 'pending')])).toBe('pending');
+      finishCancel.resolve();
+      expect(await reply).toEqual({ error: expect.stringContaining('the voice stopped (3):') });
+      await cancelled.promise;
+      writeFileSync(join(dir, 'voice.ts'), FAKE_VOICE);
+      expect(await host.clip(clip('zwei'))).toEqual({ ok: true, seconds: 0.01 });
+    } finally {
+      finishCancel.resolve();
+      timer.mockRestore();
+      host?.stop();
+      spawned.mockRestore();
+      if (existsSync(pidFile)) {
+        try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch {}
+      }
+    }
   });
 });
 
