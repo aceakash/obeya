@@ -272,7 +272,8 @@ test('a restart installs the dependencies only when package.json or bun.lock cha
 test('an install that fails is told, not thrown', () => {
   const start = git(repo, 'rev-parse', 'HEAD');
   commit('package.json', '{}');
-  const failed = installDependencies(repo, start, [process.execPath, '-e', "console.error('no network'); process.exit(1)"]);
+  // Emit the fixture's exact bytes: Bun's console.error adds color under a terminal test runner.
+  const failed = installDependencies(repo, start, [process.execPath, '-e', "await Bun.write(Bun.stderr, 'no network\\n'); process.exit(1)"]);
   expect(failed).toEqual({ ran: true, ok: false, output: 'no network' });
   expect(installDependencies(repo, start, [join(repo, 'no-such-bun')])).toMatchObject({ ran: true, ok: false });
   // a commit that is not there any more counts as changed

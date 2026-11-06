@@ -6,6 +6,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { removeTemplates } from './testing';
 
+// Bun's parallel workers inherit FORCE_COLOR from a terminal reporter. Fixture subprocesses
+// must emit the same diagnostic bytes when the suite is run in a terminal or redirected to a log.
+process.env.FORCE_COLOR = '0';
+process.env.NO_COLOR = '1';
+
 // Whatever the tests put in the temp directory goes into one of this run, removed after the run. A
 // run that was killed (Obeya restarting stops its workers' test runs) never got there: the next run
 // removes the directories of runs whose process is gone.
