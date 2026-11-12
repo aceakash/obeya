@@ -9,7 +9,7 @@ import { archivedWithDone, nameless, needsYou, titleFrom, unreadAnswers, unreadP
 import type { ConfigProblem } from '../core/config';
 import { api, beforeReload, type CanvasFeed, cardsOn, onNotice, quietAtStart, reportFocus, setCanvas, useCanvas } from './api';
 import { goTo, onSwitch } from './switch';
-import { GroupNames, TerritoryLayer, useTerritories } from './groups';
+import { GroupNames, TerritoryLayer, useGroupNames, useTerritories } from './groups';
 import { besideSheet, BOTTOM, type Cam, camFor, centreOn, chase, dragLimit, edgeScroll, FAR, flying, flyTo, keepInView, MAX_ZOOM, midX, MIN_ZOOM, NO_SIDES, overviewCam, placeIn, shows, type Sides, stopFlight, TOP, toWorld } from './camera';
 import { plain } from './markdown';
 import { CardNumber } from './cardNumber';
@@ -313,6 +313,7 @@ function Canvas({
     const h = setTimeout(() => writeJson(local, camKey(snapshot.canvas.id), besideSheet(cam, camSide.current, NO_SIDES)), 300);
     return () => clearTimeout(h);
   }, [cam, snapshot.canvas.id]);
+  const groupNames = useGroupNames(territories.shapes, placed, notes, cam.s);
   const [tick, setTick] = useState(0);
   useEffect(() => {
     const onResize = () => setTick((n) => n + 1);
@@ -1386,7 +1387,7 @@ function Canvas({
         >
           <div id="world" style={{ transform: `translate(${cam.x}px,${cam.y}px) scale(${cam.s})` }}>
             <TerritoryLayer {...territories} selected={placed.filter((p) => (ring ? ring.ids : marked).includes(p.item.id)).map((p) => p.b)} />
-            <GroupNames shapes={territories.shapes} />
+            <GroupNames names={groupNames} />
             <Links placed={placed} waits={shownWaits} standsFor={standsForId} />
             <DepLinks placed={placed} waits={shownWaits} lit={deps?.edges ?? []} steps={deps?.steps} loops={loops.flatMap((l) => l.edges)} standsFor={standsForId} s={cam.s}>
               {(shift) => <ManualEdges dep={dep} placed={placed} waitKeys={waitKeys} loops={loops} standsFor={standsForId} s={cam.s} shift={shift} onLoop={resolveLoop} />}
@@ -1414,6 +1415,7 @@ function Canvas({
                 />
               ),
             )}
+            <GroupNames names={groupNames} over />
             <ConnectionDots dep={dep} placed={placed} underway={underway} depOf={depOf} />
             {planDirs?.map((d, n) => (
               <PlanDirNote
